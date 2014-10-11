@@ -4,8 +4,8 @@ function chatEvent(nym, status, utterance, stamp) {
   return ["chatEvent", nym, status, utterance, stamp || +(new Date())];
 }
 
-function halfConnection(fromNym, toNym, sdp) {
-  return ["route", fromNym, toNym, sdp];
+function halfConnection(fromNym, toNym, sdp, ice) {
+  return ["route", fromNym, toNym, sdp, ice];
 }
 
 function remoteValue(x, metaLevel) {
@@ -46,7 +46,7 @@ $(document).ready(function () {
     //
 
     var dm = new Minimart.DemandMatcher(remoteValue(chatEvent(_$, __, __, __)), 0, {
-      supplyProjection: remoteValue(halfConnection(__, _$, __))
+      supplyProjection: remoteValue(halfConnection(__, _$, __, __))
     });
     dm.onDemandIncrease = function (captures) {
       spawnRoute(captures[0]);
@@ -59,9 +59,11 @@ $(document).ready(function () {
     //
 
     function spawnRoute(remoteNym) {
-      console.log("spawnRoute", remoteNym);
       var RTCPeerConnection = (window.RTCPeerConnection || window.mozRTCPeerConnection || window.webkitRTCPeerConnection);
       var RTCSessionDescription = (window.RTCSessionDescription || window.mozRTCSessionDescription || window.webkitRTCSessionDescription);
+      var RTCIceCandidate = (window.RTCIceCandidate || window.mozRTCIceCandidate || window.webkitRTCIceCandidate);
+
+      console.log("spawnRoute", remoteNym);
 
       World.spawn(new Actor(function () {
 	var self = this;
@@ -70,41 +72,81 @@ $(document).ready(function () {
 
 	if (localNym !== remoteNym) {
 	  self.pc = new RTCPeerConnection(rtcConfig);
-	  console.log(self.pc);
 	  self.ch = self.pc.createDataChannel('x'); // TODO -- label
+	  self.localSdp = null;
+	  self.localIce = [];
+	  self.remoteSdp = null;
+	  self.remoteIce = [];
+
+	  // WebRTC likes to pretend UDP is like a phone call.
+	  self.isOriginator = localNym < remoteNym;
 
     	  var errback = World.wrap(function (err) { // TODO - make a standard World utility?
     	    throw err;
     	  });
 
-	  setTimeout(World.wrap(function () {
-	    self.pc.onicecandidate = World.wrap(function (e) {
-    	      self.localSdp = self.pc.localDescription.sdp;
-    	      self.updateRoutes();
-	    });
+	  function flushLocalIce() {
+	    if (!self.remoteSdp) { return; }
+	    while (self.localIce.length) {
+	      World.send(remoteValue(halfConnection(localNym,
+						    remoteNym,
+						    self.localSdp,
+						    self.localIce.shift())));
+	    }
+	  }
 
+	  self.pc.onicecandidate = World.wrap(function (e) {
+	    if (e && e.candidate) {
+	      var ice = [e.candidate.candidate, e.candidate.sdpMLineIndex, e.candidate.sdpMid];
+	      console.log("LOCAL CANDIDATE", JSON.stringify(ice));
+	      self.localIce.push(ice);
+	      flushLocalIce();
+	    }
+	  });
+
+	  if (self.isOriginator) {
     	    self.pc.createOffer(function (offer) {
-	      console.log("HERE", self.pc.setLocalDescription);
-	      console.log("BLAH", new RTCSessionDescription(offer));
-    	      self.pc.setLocalDescription(new RTCSessionDescription(offer), function () {}, errback);
+    	      self.pc.setLocalDescription(new RTCSessionDescription(offer), function () {
+    		self.localSdp = self.pc.localDescription.sdp;
+		self.updateRoutes();
+	      }, errback);
     	    }, errback);
-	  }), 0);
+	  }
 
 	  Actor.advertise(
-    	    function () { return remoteValue(halfConnection(localNym, remoteNym, self.localSdp)) },
-    	    { when: function () { return self.localSdp } });
+    	    function () { return remoteValue(halfConnection(localNym,
+							    remoteNym,
+							    self.localSdp,
+							    __)) },
+    	    { when: function () { return self.local.sdp } });
+
+	  Actor.subscribe(
+	    function () { return remoteValue(halfConnection(remoteNym,
+							    localNym,
+							    __,
+							    _$("ice"))) },
+	    function (ice) {
+	      console.log("REMOTE CANDIDATE", JSON.stringify(ice));
+	      var candidate = new RTCIceCandidate({ candidate: ice[0],
+						    sdpMLineIndex: ice[1],
+						    sdpMid: ice[2] });
+	      self.pc.addIceCandidate(candidate);
+	    });
 
 	  Actor.observeAdvertisers(
-    	    function () { return remoteValue(halfConnection(remoteNym, localNym, _$("sdp"))) },
-    	    { singleton: "remoteSdp" },
+    	    function () { return remoteValue(halfConnection(remoteNym,
+							    localNym,
+							    _$("sdp"),
+							    __)) },
+    	    { singleton: "remote" },
     	    function () {
-	      if (self.localSdp && self.remoteSdp) {
-		var params = {
+	      if (self.local.sdp && self.remote) {
+		var remoteSessionDescription = new RTCSessionDescription({
 		  type: "offer",
-		  sdp: self.remoteSdp.sdp
-		};
-		console.log("Local SDP is", self.localSdp);
-		console.log("Remote SDP is", params);
+		  sdp: self.remote.sdp
+		});
+		// console.log("Local SDP is", self.localSdp);
+		// console.log("Remote SDP is", params);
 		self.pc.setRemoteDescription(new RTCSessionDescription(params), function () {}, errback);
 	      }
     	    });
